@@ -19,6 +19,15 @@
 # downstream port is blocked entirely. DNS for clients is served by a temporary
 # dnsmasq whose upstream queries are pinned to the VPN interface.
 #
+# Optional split routing for Russia: destinations in Russian IP ranges (RIPE
+# country list, downloaded at start) and IPs of Russian domains (.ru, .su, .рф,
+# well-known Russian services, resolved via the ISP's DNS) bypass the VPN and go
+# directly out of the original uplink (Wi-Fi, USB modem or wired). Everything
+# else still goes only through the VPN. Extra entries can be put next to the script:
+#   direct-domains.txt  one domain per line (subdomains included), # comments
+#   direct-cidrs.txt    one IPv4 address or CIDR per line, # comments
+#   ru-cidrs.txt        offline fallback for the Russian IP list if download fails
+#
 # Usage:
 #   sudo ./vpn-router.sh            interactive setup
 #   sudo ./vpn-router.sh --cleanup  revert leftovers of a previous run (normally automatic)
@@ -32,6 +41,19 @@ readonly LOCK=/run/$NAME.lock
 readonly LOG=$STATE_DIR/dnsmasq.log
 SELF=$(readlink -f "$0")
 readonly SELF
+readonly SELF_DIR=${SELF%/*}
+readonly MARK=0x5255                       # fwmark/ctmark of "direct" (Russian) traffic
+readonly RU_CIDR_URLS=(
+    'https://stat.ripe.net/data/country-resource-list/data.json?resource=RU&v4_format=prefix'
+    'https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone'
+)
+# Russian TLDs (рф, москва, дети, рус) and Russian services living on other TLDs.
+readonly DEFAULT_DIRECT_DOMAINS=(
+    ru su xn--p1ai xn--80adxhks xn--d1acj3b xn--p1acf moscow tatar
+    yandex.net yandex.com yastatic.net yandexcloud.net yandex.cloud
+    vk.com vk.me userapi.com vkuser.net vkuservideo.net vk-cdn.net mycdn.me
+    avito.st 2gis.com sberbank.com
+)
 
 # ---------------------------------------------------------------- output ----
 
@@ -176,6 +198,10 @@ is_ethernet() {
     [[ $(cat "$p/type" 2>/dev/null) == 1 ]]
 }
 
+is_p2p() { ip -o link show dev "$1" 2>/dev/null | grep -qE 'POINTOPOINT|NOARP'; }
+
+is_virtual() { [[ $1 =~ ^(lo|docker|br-|veth|virbr|vnet|lxc|lxd|vmnet|vboxnet|cni|flannel|podman) ]]; }
+
 is_vpn_like() {
     local i=$1 t kind
     t=$(cat "/sys/class/net/$i/type" 2>/dev/null || true)
@@ -281,7 +307,7 @@ pick_vpn() {
 pick_vpn_gateway() {
     # Point-to-point tunnels (tun, wireguard, amneziawg) need no next hop.
     VPN_GW=
-    if ip -o link show dev "$VPN" | grep -qE 'POINTOPOINT|NOARP'; then return; fi
+    if is_p2p "$VPN"; then return; fi
     VPN_GW=$(ip -4 route show dev "$VPN" 2>/dev/null |
         awk '{for (i = 1; i < NF; i++) if ($i == "via") {print $(i + 1); exit}}')
     echo
@@ -337,17 +363,164 @@ pick_dns() {
     done
 }
 
+# Gateway of the original (non-VPN) uplink. VPN clients usually keep the old
+# default route with a higher metric, or at least a host route to the VPN server.
+isp_gw() {
+    local gw
+    [[ -n $ISP_GW_FIXED ]] && { echo "$ISP_GW_FIXED"; return; }
+    gw=$(ip -4 route show default table main dev "$ISP" 2>/dev/null |
+        awk '{for (i = 1; i < NF; i++) if ($i == "via") {print $(i + 1); exit}}')
+    if [[ -z $gw ]] && nm_running; then
+        gw=$(nmcli -g IP4.GATEWAY device show "$ISP" 2>/dev/null || true)
+    fi
+    if [[ -z $gw ]]; then
+        gw=$(ip -4 route show table main dev "$ISP" 2>/dev/null |
+            awk '{for (i = 1; i < NF; i++) if ($i == "via") {print $(i + 1); exit}}')
+    fi
+    valid_ip "$gw" && echo "$gw"
+    return 0
+}
+
+iface_kind() {
+    local p=/sys/class/net/$1
+    if [[ -e $p/wireless || -e $p/phy80211 ]]; then echo "Wi-Fi"
+    elif [[ $1 == ww* || $(cat "$p/type" 2>/dev/null) == 512 ]]; then echo "mobile modem"
+    elif [[ $(readlink -f "$p/device" 2>/dev/null) == */usb* ]]; then echo "USB network"
+    else echo "wired"; fi
+}
+
+pick_split() {
+    echo
+    info "${B}Split routing for Russia${N}"
+    echo "  Russian IP ranges and Russian domains (.ru .su .рф ... + popular RU services)"
+    echo "  can go directly through your normal Internet connection instead of the VPN."
+    if confirm "Enable direct routing for Russian sites?"; then SPLIT=1; else SPLIT=0; fi
+}
+
+pick_isp() {
+    local list=() i p n idx def_dev def_n=1 gw
+    while :; do
+        list=()
+        for p in /sys/class/net/*; do
+            i=${p##*/}
+            [[ $i == "$DS" || $i == "$VPN" ]] && continue
+            is_virtual "$i" && continue
+            is_vpn_like "$i" && [[ $(cat "$p/type") != 512 ]] && continue
+            iface_up "$i" || continue
+            [[ -n $(ip -4 -o addr show dev "$i" 2>/dev/null) ]] || continue
+            list+=("$i")
+        done
+        # Preselect the non-VPN interface holding the best default route.
+        def_dev=$(ip -4 route show default table main 2>/dev/null |
+            awk '{m = 0; for (i = 1; i < NF; i++) if ($i == "metric") m = $(i + 1);
+                  for (i = 1; i < NF; i++) if ($i == "dev") print m, $(i + 1)}' |
+            sort -n | awk '{print $2}' | while read -r i; do
+                [[ " ${list[*]} " == *" $i "* ]] && { echo "$i"; break; }; done || true)
+        echo
+        info "${B}Original Internet connection for direct (Russian) traffic${N}"
+        n=0
+        for i in "${list[@]}"; do
+            n=$((n + 1))
+            [[ $i == "$def_dev" ]] && def_n=$n
+            ISP=$i ISP_GW_FIXED='' gw=$(isp_gw)
+            is_p2p "$i" && gw=${gw:-point-to-point}
+            printf '  %d) %-16s %-13s %-18s gateway: %s%s\n' "$n" "$i" "$(iface_kind "$i")" \
+                "$(ip -4 -o addr show dev "$i" | awk '{print $4}' | head -n1)" "${gw:-${R}not found${N}}" \
+                "$([[ $i == "$def_dev" ]] && echo " ${G}(default uplink)${N}")"
+        done
+        (( n == 0 )) && warn "No usable uplink interfaces found (Wi-Fi / modem / wired with an IPv4 address)."
+        echo "  r) rescan"
+        ask idx "Choose" "$( (( n > 0 )) && echo "$def_n" || echo r)"
+        [[ $idx == r ]] && continue
+        if [[ $idx =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= n )); then
+            ISP=${list[idx - 1]} ISP_GW_FIXED=''
+            if [[ -z $(isp_gw) ]] && ! is_p2p "$ISP"; then
+                warn "Could not detect the gateway on $ISP."
+                while :; do
+                    ask ISP_GW_FIXED "Gateway on $ISP" ""
+                    valid_ip "$ISP_GW_FIXED" && break
+                    warn "invalid IPv4 address"
+                done
+            fi
+            return
+        fi
+        warn "invalid choice"
+    done
+}
+
+pick_direct_dns() {
+    local detected='' d
+    if command -v resolvectl >/dev/null; then
+        for d in $(resolvectl dns "$ISP" 2>/dev/null | sed 's/^[^:]*://'); do
+            valid_ip "$d" && detected+="$d "
+        done
+    fi
+    detected=${detected% }
+    echo
+    info "${B}DNS for Russian domains${N} (queried directly through $ISP, so answers are geo-correct)"
+    [[ -n $detected ]] && echo "  DNS of your ISP connection: $detected"
+    echo "  Yandex DNS: 77.88.8.8 77.88.8.1"
+    while :; do
+        ask DIRECT_DNS "DNS servers, space separated" "${detected:-77.88.8.8 77.88.8.1}"
+        local bad=0
+        for d in $DIRECT_DNS; do valid_ip "$d" || bad=1; done
+        (( bad == 0 )) && [[ -n $DIRECT_DNS ]] && return
+        warn "enter IPv4 addresses only"
+    done
+}
+
+read_list_file() { # strips comments/blank lines
+    [[ -f $1 ]] || return 0
+    sed 's/#.*//; s/[[:space:]]//g' "$1" | grep -v '^$' || true
+}
+
+normalize_domain() {
+    local d=${1,,}
+    if [[ $d == *[![:ascii:]]* ]]; then             # рф -> xn--p1ai
+        if command -v idn2 >/dev/null; then d=$(idn2 "$d" 2>/dev/null) || return 0
+        else d=$(python3 -c 'import sys; print(sys.argv[1].encode("idna").decode())' "$d" 2>/dev/null) || return 0
+        fi
+    fi
+    d=${d#\*.}; d=${d#.}; d=${d%.}
+    [[ $d =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]] && echo "$d"
+    return 0
+}
+
+pick_direct_domains() {
+    local extra d n raw=("${DEFAULT_DIRECT_DOMAINS[@]}")
+    mapfile -t -O "${#raw[@]}" raw < <(read_list_file "$SELF_DIR/direct-domains.txt")
+    echo
+    info "${B}Domains routed directly${N} (each includes all its subdomains)"
+    echo "  Built in: ${DEFAULT_DIRECT_DOMAINS[*]}"
+    [[ -f $SELF_DIR/direct-domains.txt ]] && echo "  Plus $SELF_DIR/direct-domains.txt"
+    ask extra "Additional domains, space separated (Enter = none)" ""
+    for d in $extra; do raw+=("$d"); done
+    DIRECT_DOMAINS=()
+    for d in "${raw[@]}"; do
+        n=$(normalize_domain "$d")
+        if [[ -z $n ]]; then warn "ignoring invalid domain '$d'"; continue; fi
+        [[ " ${DIRECT_DOMAINS[*]} " == *" $n "* ]] || DIRECT_DOMAINS+=("$n")
+    done
+}
+
 # ----------------------------------------------------------------- setup ----
 
-pick_table() {
+free_table() { # free_table [excluded table] -> prints a free routing table number
     local t
     for t in $(seq 7399 7499); do
+        [[ $t == "${1:-}" ]] && continue
         [[ -z $(ip -4 route show table "$t" 2>/dev/null) ]] || continue
         ip -4 rule show 2>/dev/null | grep -qE "^$t:|lookup $t( |$)" && continue
-        RT=$t
+        echo "$t"
         return
     done
     die "no free routing table found"
+}
+
+pick_tables() {
+    RT=$(free_table)                        # everything from the router -> VPN
+    (( SPLIT )) && RT_DIRECT=$(free_table "$RT")   # Russian destinations -> ISP
+    return 0
 }
 
 vpn_route_present() { [[ $(ip -4 route show table "$RT" 2>/dev/null) == *"dev $VPN "* ]]; }
@@ -361,16 +534,111 @@ add_vpn_route() {
     fi
 }
 
-tune_vpn_iface() { # loose reverse-path filter, so replies arriving via the tunnel are accepted
+# What the direct table depends on; when it changes (DHCP renew, roaming,
+# modem re-plugged) the table is rebuilt.
+isp_signature() {
+    printf '%s|%s|%s' "$(iface_index "$ISP")" "$(isp_gw)" \
+        "$(ip -4 route show table main dev "$ISP" scope link 2>/dev/null | awk '{print $1}' | paste -sd, -)"
+}
+
+# Direct table: the uplink's on-link networks + default via its gateway. No
+# blackhole here on purpose: if the uplink has no route, Russian traffic falls
+# through to the VPN table instead of being dropped.
+sync_direct_table() {
+    local gw r
+    ip -4 route flush table "$RT_DIRECT" 2>/dev/null || true
+    iface_up "$ISP" || return 1
+    while read -r r; do
+        [[ -n $r ]] && { ip -4 route add "$r" dev "$ISP" table "$RT_DIRECT" 2>/dev/null || true; }
+    done < <(ip -4 route show table main dev "$ISP" scope link 2>/dev/null | awk '{print $1}')
+    gw=$(isp_gw)
+    if [[ -n $gw ]]; then
+        ip -4 route add default via "$gw" dev "$ISP" metric 10 table "$RT_DIRECT" 2>/dev/null
+    elif is_p2p "$ISP"; then
+        ip -4 route add default dev "$ISP" metric 10 table "$RT_DIRECT" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+direct_route_present() { [[ $(ip -4 route show table "$RT_DIRECT" 2>/dev/null) == *"default "*"dev $ISP "* ]]; }
+
+loosen_rp() { # loose reverse-path filter, so asymmetric replies are accepted
     local rp
-    rp=$(sysctl -n "net/ipv4/conf/$VPN/rp_filter" 2>/dev/null) || return 0
-    [[ $rp == 1 ]] && set_sysctl "net/ipv4/conf/$VPN/rp_filter" 2
+    rp=$(sysctl -n "net/ipv4/conf/$1/rp_filter" 2>/dev/null) || return 0
+    [[ $rp == 1 ]] && set_sysctl "net/ipv4/conf/$1/rp_filter" 2
     return 0
 }
 
+# Russian IPv4 ranges -> $STATE_DIR/ru.cidr (normalized, nested prefixes removed).
+fetch_ru_cidrs() {
+    local rawf=$STATE_DIR/ru.raw url n
+    : >"$rawf"
+    if command -v curl >/dev/null; then
+        for url in "${RU_CIDR_URLS[@]}"; do
+            info "Downloading Russian IP ranges from ${url%%\?*}"
+            if curl -fsSL --max-time 30 "$url" -o "$rawf.dl" 2>/dev/null; then
+                grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' "$rawf.dl" >"$rawf" || true
+                n=$(wc -l <"$rawf")
+                (( n > 1000 )) && break
+                warn "unexpected content ($n prefixes), trying next source"
+                : >"$rawf"
+            else
+                warn "download failed"
+            fi
+        done
+        rm -f "$rawf.dl"
+    fi
+    if [[ ! -s $rawf && -f $SELF_DIR/ru-cidrs.txt ]]; then
+        info "Using offline list $SELF_DIR/ru-cidrs.txt"
+        read_list_file "$SELF_DIR/ru-cidrs.txt" >"$rawf"
+    fi
+    [[ -s $rawf ]] || warn "No Russian IP list available - only domain-based direct routing will work."
+    read_list_file "$SELF_DIR/direct-cidrs.txt" >>"$rawf"
+    awk '
+        {
+            split($0, a, "/"); len = (a[2] == "" ? 32 : a[2]) + 0
+            if (split(a[1], o, ".") != 4 || len < 8 || len > 32) next
+            ip = 0
+            for (i = 1; i <= 4; i++) { if (o[i] !~ /^[0-9]+$/ || o[i] > 255) next; ip = ip * 256 + o[i] }
+            blk = 2 ^ (32 - len); ip = int(ip / blk) * blk
+            printf "%.0f %.0f %d.%d.%d.%d/%d\n", ip, ip + blk - 1,
+                int(ip / 16777216), int(ip / 65536) % 256, int(ip / 256) % 256, ip % 256, len
+        }' "$rawf" | sort -k1,1n -k2,2nr |
+        awk '$1 > last || NR == 1 { print $3; last = $2 }' >"$STATE_DIR/ru.cidr"
+    rm -f "$rawf"
+}
+
+load_ru_cidrs() {
+    RU_COUNT=0
+    [[ -s $STATE_DIR/ru.cidr ]] || return 0
+    awk -v t="$NAME" '
+        { b = b (c++ ? ", " : "") $0 }
+        c == 1000 { print "add element inet " t " ru_dst { " b " }"; b = ""; c = 0 }
+        END { if (c) print "add element inet " t " ru_dst { " b " }" }' \
+        "$STATE_DIR/ru.cidr" >"$STATE_DIR/ru.nft"
+    if nft -f "$STATE_DIR/ru.nft"; then
+        RU_COUNT=$(wc -l <"$STATE_DIR/ru.cidr")
+    else
+        warn "failed to load the Russian IP list into nftables - only domains will be routed directly"
+    fi
+    rm -f "$STATE_DIR/ru.nft"
+}
+
+write_dnsmasq_conf() {
+    local conf=$STATE_DIR/dnsmasq.conf d s
+    : >"$conf"
+    (( SPLIT )) || return 0
+    for d in "${DIRECT_DOMAINS[@]}"; do
+        for s in $DIRECT_DNS; do echo "server=/$d/$s@$ISP"; done
+        echo "nftset=/$d/4#inet#$NAME#ru_dns"
+    done >>"$conf"
+}
+
 start_dnsmasq() {
+    write_dnsmasq_conf
     local args=(
-        --keep-in-foreground --conf-file=/dev/null --no-resolv --no-hosts
+        --keep-in-foreground --conf-file="$STATE_DIR/dnsmasq.conf" --no-resolv --no-hosts
         --bind-interfaces --interface="$DS" --except-interface=lo --listen-address="$GW_IP"
         --dhcp-range="$POOL_START,$POOL_END,255.255.255.0,1h" --dhcp-authoritative
         --dhcp-leasefile="$STATE_DIR/leases"
@@ -395,12 +663,37 @@ restart_dnsmasq() {
 }
 
 apply_nft() {
+    local sets='' pre='' fwd='' nat=''
+    if (( SPLIT )); then
+        # New connections from the router to Russian destinations get a conntrack
+        # mark; every packet of such a connection then carries the fwmark that
+        # selects the direct routing table. The mark sticks to the connection, so
+        # it keeps its path for its whole life.
+        sets="
+    set ru_dst { type ipv4_addr; flags interval; }
+    set ru_dns { type ipv4_addr; }
+    counter fwd_direct { }"
+        pre="
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        iifname \"$DS\" ct state new ip daddr @ru_dst ct mark set $MARK
+        iifname \"$DS\" ct state new ip daddr @ru_dns ct mark set $MARK
+        iifname \"$DS\" ct mark $MARK meta mark set $MARK
+    }"
+        fwd="
+        iifname \"$DS\" oifname \"$ISP\" meta mark $MARK ip saddr $SUBNET counter name \"fwd_direct\" accept
+        iifname \"$ISP\" oifname \"$DS\" ct state established,related accept"
+        nat="
+        oifname \"$ISP\" ip saddr $SUBNET masquerade"
+    fi
     undo_push nft delete table inet "$NAME"
     nft -f - <<EOF
 table inet $NAME {
     counter fwd_out { }
     counter fwd_blocked { }
     counter in_blocked { }
+$sets
+$pre
 
     chain input {
         type filter hook input priority filter - 5; policy accept;
@@ -420,6 +713,7 @@ table inet $NAME {
         iifname "$VPN" oifname "$DS" tcp flags syn tcp option maxseg size set rt mtu
         iifname "$DS" oifname "$VPN" ip saddr $SUBNET counter name "fwd_out" accept
         iifname "$VPN" oifname "$DS" ct state established,related accept
+$fwd
         iifname "$DS" counter name "fwd_blocked" drop
         oifname "$DS" drop
     }
@@ -427,6 +721,7 @@ table inet $NAME {
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
         oifname "$VPN" ip saddr $SUBNET masquerade
+$nat
     }
 }
 EOF
@@ -438,10 +733,29 @@ apply_iptables() {
     have_iptables || return 0
     ipt_accept FORWARD -i "$DS" -o "$VPN" -s "$SUBNET"
     ipt_accept FORWARD -i "$VPN" -o "$DS" -m conntrack --ctstate RELATED,ESTABLISHED
+    if (( SPLIT )); then
+        ipt_accept FORWARD -i "$DS" -o "$ISP" -s "$SUBNET" -m mark --mark "$MARK"
+        ipt_accept FORWARD -i "$ISP" -o "$DS" -m conntrack --ctstate RELATED,ESTABLISHED
+    fi
     ipt_accept INPUT -i "$DS" -p udp --dport 67
     ipt_accept INPUT -i "$DS" -d "$GW_IP" -p udp --dport 53
     ipt_accept INPUT -i "$DS" -d "$GW_IP" -p tcp --dport 53
     ipt_accept INPUT -i "$DS" -p icmp --icmp-type echo-request
+}
+
+add_rule() { # add_rule <ip rule selector/action...> - journaled
+    undo_push ip -4 rule del "$@"
+    ip -4 rule add "$@"
+}
+
+# dnsmasq's upstream sockets are bound to an interface (server=x@iface); make
+# sure such DNS queries find a route through that interface.
+add_dns_rules() { # add_dns_rules IFACE TABLE PRIORITY
+    local proto
+    for proto in udp tcp; do
+        add_rule oif "$1" ipproto "$proto" dport 53 lookup "$2" priority "$3" 2>/dev/null ||
+            { warn "kernel/iproute2 too old for 'ip rule ... dport', relying on main table for DNS via $1"; return 0; }
+    done
 }
 
 setup() {
@@ -452,6 +766,8 @@ setup() {
 
     # Watchdog: survives kill -9 of this script and reverts everything.
     setsid "$SELF" --guardian $$ </dev/null >/dev/null 2>&1 &
+
+    (( SPLIT )) && fetch_ru_cidrs
 
     info "Taking $DS away from NetworkManager (runtime only)"
     if nm_running && [[ $(nm_dev_state "$DS") != unmanaged ]]; then
@@ -475,19 +791,33 @@ setup() {
     set_sysctl net/ipv4/ip_forward 1
     set_sysctl "net/ipv6/conf/$DS/disable_ipv6" 1
     [[ $(sysctl -n net/ipv4/conf/all/rp_filter) == 1 ]] && set_sysctl net/ipv4/conf/all/rp_filter 2
-    tune_vpn_iface
+    loosen_rp "$VPN"
+    (( SPLIT )) && loosen_rp "$ISP"
 
     info "Firewall / NAT / kill switch"
     apply_nft
     apply_iptables
+    if (( SPLIT )); then
+        load_ru_cidrs
+        ok "Russian IP ranges loaded: $RU_COUNT prefixes"
+    fi
 
     info "Policy routing: everything from $DS -> $VPN only (table $RT)"
-    undo_push ip -4 rule del iif "$DS" lookup "$RT" priority "$RT"
     undo_push ip -4 route flush table "$RT"
     ip -4 route add "$SUBNET" dev "$DS" table "$RT"
     ip -4 route add blackhole default metric 4000 table "$RT"   # VPN down => drop, never fall back
     add_vpn_route || warn "could not add route via $VPN (is it up?)"
-    ip -4 rule add iif "$DS" lookup "$RT" priority "$RT"
+    add_rule iif "$DS" lookup "$RT" priority "$RT"
+    add_dns_rules "$VPN" "$RT" $((RT - 3))
+
+    if (( SPLIT )); then
+        info "Policy routing: Russian destinations from $DS -> $ISP (table $RT_DIRECT)"
+        undo_push ip -4 route flush table "$RT_DIRECT"
+        sync_direct_table || warn "no route via $ISP yet - Russian traffic uses the VPN until it appears"
+        ISP_SIG=$(isp_signature)
+        add_rule iif "$DS" fwmark "$MARK" lookup "$RT_DIRECT" priority $((RT - 1))
+        add_dns_rules "$ISP" "$RT_DIRECT" $((RT - 2))
+    fi
 
     info "Starting temporary DHCP/DNS server (dnsmasq) on $DS"
     undo_push kill_pidfile "$STATE_DIR/dnsmasq.pid"
@@ -513,7 +843,7 @@ human() {
 }
 
 draw_status() {
-    local out blk vpn_state fwd leases now
+    local out blk dir vpn_state fwd leases now isp_state ndns
     read -r -a out <<<"$(counter_of fwd_out)"
     read -r -a blk <<<"$(counter_of fwd_blocked)"
     if iface_up "$VPN" && vpn_route_present; then
@@ -532,6 +862,20 @@ draw_status() {
     printf '  %-13s %s\n' "Forwarding:" "$fwd"
     printf '  %-13s %s via %s\n' "Client DNS:" "$DNS" "$VPN"
     printf '  %-13s %s pkts, %s    blocked: %s pkts\n' "Sent via VPN:" "${out[0]}" "$(human "${out[1]}")" "${blk[0]}"
+    if (( SPLIT )); then
+        read -r -a dir <<<"$(counter_of fwd_direct)"
+        if direct_route_present; then
+            isp_state="${G}UP${N} via $(isp_gw || true)"
+        else
+            isp_state="${Y}no route${N} (Russian traffic falls back to $VPN)"
+        fi
+        ndns=$(nft list set inet "$NAME" ru_dns 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | wc -l || true)
+        echo
+        printf '  %-13s %s  %s\n' "Direct (RU):" "$ISP" "$isp_state"
+        printf '  %-13s %s prefixes from IP list, %s IPs of %s RU domains (DNS %s)\n' "Matching:" \
+            "$RU_COUNT" "$ndns" "${#DIRECT_DOMAINS[@]}" "$DIRECT_DNS"
+        printf '  %-13s %s pkts, %s\n' "Sent direct:" "${dir[0]}" "$(human "${dir[1]}")"
+    fi
     [[ -n $LAST_EVENT ]] && printf '  %-13s %s\n' "Last event:" "$LAST_EVENT"
     echo
     echo "  ${B}DHCP leases${N}"
@@ -543,7 +887,7 @@ draw_status() {
     echo "    or static: IP $POOL_START  mask 255.255.255.0  gateway $GW_IP  DNS $GW_IP"
     echo "    The router's LAN subnet must NOT be $SUBNET. Disable IPv6 on the router if possible."
     echo
-    echo "  ${B}[t]${N} test VPN exit IP   ${B}[l]${N} dnsmasq log   ${B}[q]${N}/Ctrl-C stop and revert everything"
+    echo "  ${B}[t]${N} test exit IPs   ${B}[l]${N} dnsmasq log   ${B}[q]${N}/Ctrl-C stop and revert everything"
 }
 
 test_exit_ip() {
@@ -552,6 +896,10 @@ test_exit_ip() {
         echo "Querying https://ifconfig.me ..."
         printf '  via %-12s (what clients get): %s\n' "$VPN" \
             "$(curl -4 -s --max-time 8 --interface "$VPN" https://ifconfig.me || echo 'FAILED')"
+        if (( SPLIT )); then
+            printf '  via %-12s (Russian sites):   %s\n' "$ISP" \
+                "$(curl -4 -s --max-time 8 --interface "$ISP" https://ifconfig.me || echo 'FAILED')"
+        fi
         printf '  laptop default route:          %s\n' \
             "$(curl -4 -s --max-time 8 https://ifconfig.me || echo 'FAILED')"
         echo
@@ -568,7 +916,7 @@ show_log() {
 }
 
 monitor() {
-    local key idx last_idx rc
+    local key idx last_idx rc sig isp_idx
     START_TS=$(date +%s) LAST_EVENT=
     last_idx=$(iface_index "$VPN")
     while :; do
@@ -577,7 +925,7 @@ monitor() {
         if [[ $idx != "$last_idx" ]]; then
             if [[ -n $idx ]]; then
                 add_vpn_route || true
-                tune_vpn_iface
+                loosen_rp "$VPN"
                 restart_dnsmasq || true
                 LAST_EVENT="$(date '+%H:%M:%S') $VPN came back, forwarding resumed"
             else
@@ -586,6 +934,21 @@ monitor() {
             last_idx=$idx
         elif [[ -n $idx ]] && ! vpn_route_present; then
             add_vpn_route && LAST_EVENT="$(date '+%H:%M:%S') route via $VPN restored" || true
+        fi
+        # Uplink changed (new gateway/address, Wi-Fi roam, modem re-plugged).
+        if (( SPLIT )); then
+            sig=$(isp_signature)
+            if [[ $sig != "$ISP_SIG" ]] || { iface_up "$ISP" && ! direct_route_present; }; then
+                isp_idx=$(iface_index "$ISP")
+                if sync_direct_table; then
+                    LAST_EVENT="$(date '+%H:%M:%S') direct route via $ISP updated"
+                else
+                    LAST_EVENT="$(date '+%H:%M:%S') no route via $ISP, Russian traffic uses $VPN"
+                fi
+                [[ -n $isp_idx ]] && loosen_rp "$ISP"
+                [[ ${ISP_SIG%%|*} != "$isp_idx" && -n $isp_idx ]] && { restart_dnsmasq || true; }
+                ISP_SIG=$sig
+            fi
         fi
         if ! kill -0 "$(cat "$STATE_DIR/dnsmasq.pid" 2>/dev/null)" 2>/dev/null; then
             restart_dnsmasq && LAST_EVENT="$(date '+%H:%M:%S') dnsmasq restarted" || true
@@ -665,14 +1028,26 @@ main() {
     pick_vpn_gateway
     pick_subnet
     pick_dns
-    pick_table
+    pick_split
+    if (( SPLIT )); then
+        pick_isp
+        pick_direct_dns
+        pick_direct_domains
+    fi
+    pick_tables
 
     echo
     info "${B}Summary${N}"
     echo "  Ethernet to router : $DS  ($GW_IP/24, DHCP $POOL_START-$POOL_END)"
     echo "  VPN interface      : $VPN${VPN_GW:+ via $VPN_GW}"
     echo "  Client DNS         : $DNS (through $VPN)"
-    echo "  Kill switch        : clients can reach the Internet ONLY via $VPN; IPv6 blocked"
+    if (( SPLIT )); then
+        echo "  Direct (Russia)    : RU IP ranges + ${#DIRECT_DOMAINS[@]} domains -> $ISP${ISP_GW_FIXED:+ via $ISP_GW_FIXED}"
+        echo "  RU domains DNS     : $DIRECT_DNS (through $ISP)"
+        echo "  Kill switch        : everything else ONLY via $VPN; IPv6 blocked"
+    else
+        echo "  Kill switch        : clients can reach the Internet ONLY via $VPN; IPv6 blocked"
+    fi
     nm_running && [[ $(nm_dev_state "$DS") == connected ]] &&
         warn "$DS is currently connected by NetworkManager ('$(nm_dev_conn "$DS")') - it will be disconnected while the script runs."
     confirm "Start?" || exit 0
